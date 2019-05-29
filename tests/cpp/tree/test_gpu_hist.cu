@@ -508,9 +508,10 @@ TEST(GpuHist, TestHistogramIndex) {
     {"n_gpus", "1"}
   };
 
-  hist_maker.Init(training_params);
+  LearnerTrainParam learner_param(CreateEmptyGenericParam(0, 1));
+  hist_maker.Init(training_params, &learner_param);
   hist_maker.InitDataOnce(hist_maker_dmat.get());
-  hist_maker_ext.Init(training_params);
+  hist_maker_ext.Init(training_params, &learner_param);
   hist_maker_ext.InitDataOnce(hist_maker_ext_dmat.get());
 
   // Extract the device shards from the histogram makers and from that its compressed
