@@ -93,7 +93,6 @@ TEST(GpuHist, BuildGidxDense) {
   int constexpr kNRows = 16, kNCols = 8;
   TrainParam param;
   param.max_depth = 1;
-  param.n_gpus = 1;
   param.max_leaves = 0;
 
   DeviceShard<GradientPairPrecise> shard(0, 0, 0, kNRows, param, kNCols);
@@ -132,7 +131,6 @@ TEST(GpuHist, BuildGidxSparse) {
   int constexpr kNRows = 16, kNCols = 8;
   TrainParam param;
   param.max_depth = 1;
-  param.n_gpus = 1;
   param.max_leaves = 0;
 
   DeviceShard<GradientPairPrecise> shard(0, 0, 0, kNRows, param, kNCols);
@@ -176,7 +174,6 @@ void TestBuildHist(GPUHistBuilderBase<GradientSumT>& builder) {
 
   TrainParam param;
   param.max_depth = 6;
-  param.n_gpus = 1;
   param.max_leaves = 0;
 
   DeviceShard<GradientSumT> shard(0, 0, 0, kNRows, param, kNCols);
@@ -271,7 +268,6 @@ TEST(GpuHist, EvaluateSplits) {
 
   TrainParam param;
   param.max_depth = 1;
-  param.n_gpus = 1;
   param.colsample_bynode = 1;
   param.colsample_bylevel = 1;
   param.colsample_bytree = 1;

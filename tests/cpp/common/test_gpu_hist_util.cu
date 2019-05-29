@@ -10,20 +10,23 @@
 
 #include "../../../src/common/device_helpers.cuh"
 #include "../../../src/common/hist_util.h"
-#include "../../../src/tree/updater_gpu_hist.cu"
 
 #include "../helpers.h"
 
 namespace xgboost {
 namespace common {
 
-void TestDeviceSketch(const GPUSet& devices, bool use_external_memory = false) {
+void TestDeviceSketch(const GPUSet& devices, bool use_external_memory) {
   // create the data
   int nrows = 10001;
   std::shared_ptr<xgboost::DMatrix> *dmat = nullptr;
 
   size_t num_cols = 1;
-  if (!use_external_memory) {
+  if (use_external_memory) {
+     auto sp_dmat = CreateSparsePageDMatrix(nrows * 3, 128UL); // 3 entries/row
+     dmat = new std::shared_ptr<xgboost::DMatrix>(std::move(sp_dmat));
+     num_cols = 5;
+  } else {
      std::vector<float> test_data(nrows);
      auto count_iter = thrust::make_counting_iterator(0);
      // fill in reverse order
@@ -34,41 +37,31 @@ void TestDeviceSketch(const GPUSet& devices, bool use_external_memory = false) {
      XGDMatrixCreateFromMat(test_data.data(), nrows, 1, -1,
                             &dmat_handle);
      dmat = static_cast<std::shared_ptr<xgboost::DMatrix> *>(dmat_handle);
-  } else {
-     auto sp_dmat = CreateSparsePageDMatrix(nrows * 3, 128UL); // 3 entries/row
-     dmat = new std::shared_ptr<xgboost::DMatrix>(std::move(sp_dmat));
-     num_cols = 5;
   }
 
-  // parameters for finding quantiles
-  const std::string max_bin = "20";
-  const std::string debug_synchronize = "true";
-#define CONVERT_TO_STR(VAR, VAL) \
-  { \
-    std::stringstream sstr; \
-    sstr << VAL; \
-    VAR = sstr.str(); \
-  }
-  std::string n_gpus; CONVERT_TO_STR(n_gpus, (devices.Size()))
-  // Training every row in a single GPU batch
-  std::string gpu_batch_nrows; CONVERT_TO_STR(gpu_batch_nrows, -1)
-
-  std::vector<std::pair<std::string, std::string>> training_params = {
-    {"max_bin", max_bin},
-    {"debug_synchronize", debug_synchronize},
-    {"n_gpus", n_gpus},
-    {"gpu_batch_nrows", gpu_batch_nrows}
-  };
+  tree::TrainParam p;
+  p.max_bin = 20;
+  int gpu_batch_nrows = 0;
 
   // find quantiles on the CPU
   HistCutMatrix hmat_cpu;
-  hmat_cpu.Init((*dmat).get(), atoi(max_bin.c_str()));
+  hmat_cpu.Init((*dmat).get(), p.max_bin);
 
   // find the cuts on the GPU
-  tree::GPUHistMakerSpecialised<GradientPairPrecise> hist_maker;
-  hist_maker.Init(training_params);
-  hist_maker.InitDataOnce(dmat->get());
-  const HistCutMatrix &hmat_gpu = hist_maker.hmat_;
+  HistCutMatrix hmat_gpu;
+  size_t row_stride = DeviceSketch(p, CreateEmptyGenericParam(0, devices.Size()), gpu_batch_nrows,
+                                   dmat->get(), &hmat_gpu);
+
+  // compare the row stride with the one obtained from the dmatrix
+  size_t expected_row_stride = 0;
+  for (const auto &batch : dmat->get()->GetRowBatches()) {
+    const auto &offset_vec = batch.offset.ConstHostVector();
+    for (int i = 1; i <= offset_vec.size() -1; ++i) {
+      expected_row_stride = std::max(expected_row_stride, offset_vec[i] - offset_vec[i-1]);
+    }
+  }
+
+  ASSERT_EQ(expected_row_stride, row_stride);
 
   // compare the cuts
   double eps = 1e-2;
@@ -84,7 +77,7 @@ void TestDeviceSketch(const GPUSet& devices, bool use_external_memory = false) {
 }
 
 TEST(gpu_hist_util, DeviceSketch) {
-  TestDeviceSketch(GPUSet::Range(0, 1));
+  TestDeviceSketch(GPUSet::Range(0, 1), false);
 }
 
 TEST(gpu_hist_util, DeviceSketch_ExternalMemory) {
@@ -95,7 +88,7 @@ TEST(gpu_hist_util, DeviceSketch_ExternalMemory) {
 TEST(gpu_hist_util, MGPU_DeviceSketch) {
   auto devices = GPUSet::AllVisible();
   CHECK_GT(devices.Size(), 1);
-  TestDeviceSketch(devices);
+  TestDeviceSketch(devices, false);
 }
 
 TEST(gpu_hist_util, MGPU_DeviceSketch_ExternalMemory) {
