@@ -623,21 +623,30 @@ __forceinline__ __device__ void CountLeft(int64_t* d_count, int val,
 template <typename GradientSumT>
 struct DeviceShard;
 
+// Instances of this type are created while creating the histogram bins for the
+// entire dataset across multiple sparse page batches. This keeps track of the number
+// of rows to process from a batch and the position from which to process on each device.
 struct RowStateOnDevice {
-  size_t n_rows_; // Number of rows assigned to this device
+  const size_t n_rows_; // Number of rows assigned to this device
   size_t n_rows_processed_; // Number of rows processed thus far
   size_t batch_n_rows_; // Number of rows to process from the current sparse page batch
   size_t row_offset_; // Offset from the current sparse page batch to begin processing
 
-  void Init(size_t nrows) {
-    n_rows_ = nrows;
-    n_rows_processed_ = batch_n_rows_ = row_offset_ = 0;
+  RowStateOnDevice(size_t nrows)
+    : n_rows_(nrows), n_rows_processed_(0), batch_n_rows_(0), row_offset_(0) {
   }
 
-  void EndBatch() {
+  // Advance the row state by the number of rows processed
+  void Advance() {
     n_rows_processed_ += batch_n_rows_;
     CHECK_LE(n_rows_processed_, n_rows_);
     batch_n_rows_ = row_offset_ = 0;
+  }
+
+  static RowStateOnDevice CreateRowStateOnDevice(size_t total_rows, size_t batch_rows) {
+    RowStateOnDevice rstate(total_rows);
+    rstate.batch_n_rows_ = batch_rows;
+    return rstate;
   }
 };
 
@@ -1400,9 +1409,9 @@ class DeviceHistogramBuilderState {
   template <typename GradientSumT>
   DeviceHistogramBuilderState(
     const std::vector<std::unique_ptr<DeviceShard<GradientSumT>>> &shards) {
-    device_row_states_.resize(shards.size());
+    device_row_states_.reserve(shards.size());
     for (const auto &shard : shards) {
-      device_row_states_[shard->shard_idx].Init(shard->n_rows);
+      device_row_states_.push_back(RowStateOnDevice(shard->n_rows));
     }
   }
 
@@ -1437,7 +1446,7 @@ class DeviceHistogramBuilderState {
   // This method is invoked after completion of each sparse page batch
   void EndBatch() {
     for (auto &rs : device_row_states_) {
-      rs.EndBatch();
+      rs.Advance();
     }
   }
 
