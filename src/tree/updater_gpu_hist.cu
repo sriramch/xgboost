@@ -15,7 +15,6 @@
 #include <queue>
 #include <utility>
 #include <vector>
-#include <cstdint>
 #include "../common/common.h"
 #include "../common/compressed_iterator.h"
 #include "../common/device_helpers.cuh"
@@ -172,10 +171,8 @@ struct ELLPackMatrix {
   }
   void Init(common::Span<uint32_t> feature_segments,
     common::Span<bst_float> min_fvalue,
-    common::Span<bst_float> gidx_fvalue_map,
-    size_t row_stride,
-    common::CompressedIterator<uint32_t> gidx_iter,
-    bool is_dense,
+    common::Span<bst_float> gidx_fvalue_map, size_t row_stride,
+    common::CompressedIterator<uint32_t> gidx_iter, bool is_dense,
     int null_gidx_value) {
     this->feature_segments = feature_segments;
     this->min_fvalue = min_fvalue;
@@ -626,6 +623,24 @@ __forceinline__ __device__ void CountLeft(int64_t* d_count, int val,
 template <typename GradientSumT>
 struct DeviceShard;
 
+struct RowStateOnDevice {
+  size_t n_rows_; // Number of rows assigned to this device
+  size_t n_rows_processed_; // Number of rows processed thus far
+  size_t batch_n_rows_; // Number of rows to process from the current sparse page batch
+  size_t row_offset_; // Offset from the current sparse page batch to begin processing
+
+  void Init(size_t nrows) {
+    n_rows_ = nrows;
+    n_rows_processed_ = batch_n_rows_ = row_offset_ = 0;
+  }
+
+  void EndBatch() {
+    n_rows_processed_ += batch_n_rows_;
+    CHECK_LE(n_rows_processed_, n_rows_);
+    batch_n_rows_ = row_offset_ = 0;
+  }
+};
+
 template <typename GradientSumT>
 struct GPUHistBuilderBase {
  public:
@@ -715,8 +730,8 @@ struct DeviceShard {
       const common::HistCutMatrix& hmat, size_t row_stride, bool is_dense);
 
   void CreateHistIndices(
-      const SparsePage& row_batch, const common::HistCutMatrix &hmat,
-      const std::vector<std::pair<size_t, size_t>> &shard_allocations, int rows_per_batch);
+      const SparsePage &row_batch, const common::HistCutMatrix &hmat,
+      const RowStateOnDevice &device_row_state, int rows_per_batch);
 
   ~DeviceShard() {
     dh::safe_cuda(cudaSetDevice(device_id));
@@ -1238,7 +1253,7 @@ struct GlobalMemHistBuilder : public GPUHistBuilderBase<GradientSumT> {
 
 template <typename GradientSumT>
 inline void DeviceShard<GradientSumT>::InitCompressedData(
-    const common::HistCutMatrix& hmat, size_t row_stride, bool is_dense) {
+    const common::HistCutMatrix &hmat, size_t row_stride, bool is_dense) {
   n_bins = hmat.row_ptr.back();
   int null_gidx_value = hmat.row_ptr.back();
 
@@ -1305,24 +1320,20 @@ template <typename GradientSumT>
 inline void DeviceShard<GradientSumT>::CreateHistIndices(
     const SparsePage &row_batch,
     const common::HistCutMatrix &hmat,
-    const std::vector<std::pair<size_t, size_t>> &shard_allocations,
+    const RowStateOnDevice &device_row_state,
     int rows_per_batch) {
   // Has any been allocated for me in this batch?
-  size_t num_rows = shard_allocations[shard_idx].second;
-  if (!num_rows) return;
+  if (!device_row_state.batch_n_rows_) return;
 
   size_t row_stride = this->ellpack_matrix.row_stride;
 
-  // Take into account the rows that could be processed by other GPUs
-  size_t begin_idx(0);
-  for (size_t i = 0; i < shard_idx; ++i) begin_idx += shard_allocations[i].second;
-
-  const auto& offset_vec = row_batch.offset.ConstHostVector();
+  const auto &offset_vec = row_batch.offset.ConstHostVector();
   /*! \brief row offset in SparsePage (the input data). */
-  thrust::device_vector<size_t> row_ptrs(num_rows+1);
-  thrust::copy(offset_vec.data() + begin_idx,
-               offset_vec.data() + begin_idx + num_rows + 1,
-               row_ptrs.begin());
+  thrust::device_vector<size_t> row_ptrs(device_row_state.batch_n_rows_+1);
+  thrust::copy(
+    offset_vec.data() + device_row_state.row_offset_,
+    offset_vec.data() + device_row_state.row_offset_ + device_row_state.batch_n_rows_ + 1,
+    row_ptrs.begin());
 
   int num_symbols = n_bins + 1;
   // bin and compress entries in batches of rows
@@ -1331,22 +1342,23 @@ inline void DeviceShard<GradientSumT>::CreateHistIndices(
      gpu_batch_nrows =
       std::min
       (dh::TotalMemory(device_id) / (16 * row_stride * sizeof(Entry)),
-       static_cast<size_t>(num_rows));
+       static_cast<size_t>(device_row_state.batch_n_rows_));
   } else if (rows_per_batch == -1) {
-     gpu_batch_nrows = num_rows;
+     gpu_batch_nrows = device_row_state.batch_n_rows_;
   } else {
-     gpu_batch_nrows = std::min(num_rows, static_cast<size_t>(rows_per_batch));
+     gpu_batch_nrows =
+       std::min(device_row_state.batch_n_rows_, static_cast<size_t>(rows_per_batch));
   }
   const std::vector<Entry>& data_vec = row_batch.data.ConstHostVector();
 
   thrust::device_vector<Entry> entries_d(gpu_batch_nrows * row_stride);
-  size_t gpu_nbatches = dh::DivRoundUp(num_rows, gpu_batch_nrows);
+  size_t gpu_nbatches = dh::DivRoundUp(device_row_state.batch_n_rows_, gpu_batch_nrows);
 
   for (size_t gpu_batch = 0; gpu_batch < gpu_nbatches; ++gpu_batch) {
     size_t batch_row_begin = gpu_batch * gpu_batch_nrows;
     size_t batch_row_end = (gpu_batch + 1) * gpu_batch_nrows;
-    if (batch_row_end > num_rows) {
-      batch_row_end = num_rows;
+    if (batch_row_end > device_row_state.batch_n_rows_) {
+      batch_row_end = device_row_state.batch_n_rows_;
     }
     size_t batch_nrows = batch_row_end - batch_row_begin;
     // number of entries in this batch.
@@ -1357,7 +1369,7 @@ inline void DeviceShard<GradientSumT>::CreateHistIndices(
          (entries_d.data().get(), data_vec.data() + row_ptrs[batch_row_begin],
           n_entries * sizeof(Entry), cudaMemcpyDefault));
     const dim3 block3(32, 8, 1);  // 256 threads
-    const dim3 grid3(dh::DivRoundUp(num_rows, block3.x),
+    const dim3 grid3(dh::DivRoundUp(device_row_state.batch_n_rows_, block3.x),
                      dh::DivRoundUp(row_stride, block3.y), 1);
     CompressBinEllpackKernel<<<grid3, block3>>>
         (common::CompressedBufferWriter(num_symbols),
@@ -1366,7 +1378,7 @@ inline void DeviceShard<GradientSumT>::CreateHistIndices(
          entries_d.data().get(),
          gidx_fvalue_map.data(),
          feature_segments.data(),
-         shard_allocations[shard_idx].first + batch_row_begin,
+         device_row_state.n_rows_processed_ + batch_row_begin,
          batch_nrows,
          row_ptrs[batch_row_begin],
          row_stride,
@@ -1379,6 +1391,59 @@ inline void DeviceShard<GradientSumT>::CreateHistIndices(
   entries_d.resize(0);
   entries_d.shrink_to_fit();
 }
+
+// An instance of this type is created which keeps track of total number of rows to process,
+// rows processed thus far, rows to process and the offset from the current sparse page batch
+// to begin processing on each device
+class DeviceHistogramBuilderState {
+ public:
+  template <typename GradientSumT>
+  DeviceHistogramBuilderState(
+    const std::vector<std::unique_ptr<DeviceShard<GradientSumT>>> &shards) {
+    device_row_states_.resize(shards.size());
+    for (const auto &shard : shards) {
+      device_row_states_[shard->shard_idx].Init(shard->n_rows);
+    }
+  }
+
+  const RowStateOnDevice &GetRowStateOnDevice(int idx) const {
+    return device_row_states_[idx];
+  }
+
+  // This method is invoked at the beginning of each sparse page batch. This distributes
+  // the rows in the sparse page to the different devices.
+  // TODO(sriramch): Think of a way to utilize *all* the GPUs to build the compressed bins.
+  void BeginBatch(const SparsePage &batch) {
+    size_t rem_rows = batch.Size();
+    size_t row_offset = 0;
+    for (size_t i = 0; i < device_row_states_.size(); ++i) {
+      RowStateOnDevice &device_row_state = device_row_states_[i];
+      // Do we have anymore left to process from this batch on this device?
+      if (device_row_state.n_rows_ > device_row_state.n_rows_processed_) {
+        // There are still some rows that needs to be assigned to this device
+        device_row_state.batch_n_rows_ =
+          std::min(device_row_state.n_rows_ - device_row_state.n_rows_processed_, rem_rows);
+      } else {
+        // All rows have been assigned to this device
+        device_row_state.batch_n_rows_ = 0;
+      }
+
+      device_row_state.row_offset_ = row_offset;
+      row_offset += device_row_state.batch_n_rows_;
+      rem_rows -= device_row_state.batch_n_rows_;
+    }
+  }
+
+  // This method is invoked after completion of each sparse page batch
+  void EndBatch() {
+    for (auto &rs : device_row_states_) {
+      rs.EndBatch();
+    }
+  }
+
+ private:
+  std::vector<RowStateOnDevice> device_row_states_;
+};
 
 template <typename GradientSumT>
 class GPUHistMakerSpecialised {
@@ -1473,36 +1538,19 @@ class GPUHistMakerSpecialised {
     monitor_.StopCuda("InitCompressedData");
 
     monitor_.StartCuda("BinningCompression");
-    // TODO(sriramch): Think of a way to utilize *all* the GPUs to build the
-    // compressed bins
-    // 1st element in the pair for a given shard keeps track of rows processed thus far
-    // 2nd element in the pair for a given shard specifies the number of rows to
-    // process in this batch
-    std::vector<std::pair<size_t, size_t>> shard_allocations(shards_.size(), std::make_pair(0, 0));
+    histBuilderState_.reset(new DeviceHistogramBuilderState(shards_));
     for (const auto &batch : dmat->GetRowBatches()) {
-      // Distribute the rows in this batch to the different shards
-      size_t rem_rows = batch.Size();
-      for (size_t i = 0; i < shards_.size(); ++i) {
-        if (shards_[i]->n_rows > shard_allocations[i].first) {
-          // There are still some rows that needs to be assigned to this shard
-          shard_allocations[i].second = std::min(
-                          shards_[i]->n_rows - shard_allocations[i].first, rem_rows);
-        } else {
-          // All rows have been assigned to this shard
-          shard_allocations[i].second = 0;
-        }
-        rem_rows -= shard_allocations[i].second;
-      }
+      histBuilderState_->BeginBatch(batch);
 
       dh::ExecuteIndexShards(
         &shards_,
         [&](int idx, std::unique_ptr<DeviceShard<GradientSumT>>& shard) {
           dh::safe_cuda(cudaSetDevice(shard->device_id));
-          shard->CreateHistIndices(batch, hmat_, shard_allocations,
+          shard->CreateHistIndices(batch, hmat_, histBuilderState_->GetRowStateOnDevice(idx),
                                    hist_maker_param_.gpu_batch_nrows);
-          // Keep track of how many rows have been processed by this shard
-          shard_allocations[idx].first += shard_allocations[idx].second;
         });
+
+      histBuilderState_->EndBatch();
     }
     monitor_.StopCuda("BinningCompression");
 
@@ -1588,6 +1636,7 @@ class GPUHistMakerSpecialised {
   MetaInfo* info_;              // NOLINT
 
   std::vector<std::unique_ptr<DeviceShard<GradientSumT>>> shards_;  // NOLINT
+  std::unique_ptr<DeviceHistogramBuilderState> histBuilderState_;  // NOLINT
 
  private:
   bool initialised_;

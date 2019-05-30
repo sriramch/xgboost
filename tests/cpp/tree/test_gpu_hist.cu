@@ -83,8 +83,10 @@ void BuildGidx(DeviceShard<GradientSumT>* shard, int n_rows, int n_cols,
     row_stride = std::max(row_stride, offset_vec[i] - offset_vec[i-1]);
   }
   shard->InitCompressedData(cmat, row_stride, is_dense);
-  shard->CreateHistIndices(batch, cmat,
-                           std::vector<std::pair<size_t, size_t>>(1, {0, batch.Size()}), -1);
+  RowStateOnDevice device_row_state;
+  device_row_state.Init(batch.Size());
+  device_row_state.batch_n_rows_ = batch.Size();
+  shard->CreateHistIndices(batch, cmat, device_row_state, -1);
 
   delete dmat;
 }
@@ -504,8 +506,7 @@ TEST(GpuHist, TestHistogramIndex) {
 
   std::vector<std::pair<std::string, std::string>> training_params = {
     {"max_depth", "1"},
-    {"max_leaves", "0"},
-    {"n_gpus", "1"}
+    {"max_leaves", "0"}
   };
 
   LearnerTrainParam learner_param(CreateEmptyGenericParam(0, 1));
