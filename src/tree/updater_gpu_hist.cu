@@ -1547,19 +1547,19 @@ class GPUHistMakerSpecialised {
     monitor_.StopCuda("InitCompressedData");
 
     monitor_.StartCuda("BinningCompression");
-    histBuilderState_.reset(new DeviceHistogramBuilderState(shards_));
+    DeviceHistogramBuilderState hist_builder_row_state(shards_);
     for (const auto &batch : dmat->GetRowBatches()) {
-      histBuilderState_->BeginBatch(batch);
+      hist_builder_row_state.BeginBatch(batch);
 
       dh::ExecuteIndexShards(
         &shards_,
         [&](int idx, std::unique_ptr<DeviceShard<GradientSumT>>& shard) {
           dh::safe_cuda(cudaSetDevice(shard->device_id));
-          shard->CreateHistIndices(batch, hmat_, histBuilderState_->GetRowStateOnDevice(idx),
+          shard->CreateHistIndices(batch, hmat_, hist_builder_row_state.GetRowStateOnDevice(idx),
                                    hist_maker_param_.gpu_batch_nrows);
         });
 
-      histBuilderState_->EndBatch();
+      hist_builder_row_state.EndBatch();
     }
     monitor_.StopCuda("BinningCompression");
 
@@ -1645,7 +1645,6 @@ class GPUHistMakerSpecialised {
   MetaInfo* info_;              // NOLINT
 
   std::vector<std::unique_ptr<DeviceShard<GradientSumT>>> shards_;  // NOLINT
-  std::unique_ptr<DeviceHistogramBuilderState> histBuilderState_;  // NOLINT
 
  private:
   bool initialised_;
